@@ -12,18 +12,13 @@ Cayley グラフ（単位元が属する連結成分）を構築・描画する�
 import argparse
 from collections import deque
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
-try:
-    import networkx as nx
-    import matplotlib.pyplot as plt
-except Exception as e:
-    raise SystemExit(
-        "This script requires networkx and matplotlib. Please install them (e.g., pip install networkx matplotlib)."
-    )
+import networkx as nx
+import matplotlib.pyplot as plt
 
 
 # Matrix type: (a, b, c, d) representing [[a, b], [c, d]] in F_p
 Mat = Tuple[int, int, int, int]
+IDENTITY: Mat = (1, 0, 0, 1)
 
 
 def mat_mul(x: Mat, y: Mat, p: int) -> Mat:
@@ -77,39 +72,61 @@ def generators_Ak_Bk(k: int, p: int, symmetric: bool = True) -> List[Mat]:
     return gens
 
 
-def bfs_component(gens: Sequence[Mat], p: int, max_nodes: Optional[int] = None) -> Tuple[List[Mat], Dict[Mat, int], Dict[Mat, int]]:
+def bfs_component(
+    gens: Sequence[Mat],
+    p: int,
+    max_nodes: Optional[int] = None,
+    edge_gens: Optional[Sequence[Mat]] = None,
+) -> Tuple[List[Mat], Dict[Mat, int], Dict[Mat, int], Dict[Mat, List[Mat]]]:
     """生成元 gens による半群作用で、単位元が属する連結成分を BFS で列挙する。
 
-    単位元 I から始め、左側乗（s * g）で到達できる行列を幅優先探索で集める。
+    探索用生成元 `gens` で幅優先探索しつつ、描画用の辺を張るための近傍も
+    `edge_gens` で同時に計算して返す（後段での再計算を避ける）。
 
     引数:
-    - gens: 生成元の行列（A, B など）。無向グラフなら逆元も含める。
+    - gens: 探索に用いる生成元（無向グラフにしたいなら逆元も含める）
     - p: 法（素数を想定）
     - max_nodes: ノード数の上限（安全のための打ち切り）。None なら制限なし。
+    - edge_gens: 辺構築に用いる生成元（通常は {A, B} のみ）
 
     戻り値:
     - nodes: BFS 順の行列リスト
     - index: 行列 -> 連番インデックス の辞書
     - dist: 行列 -> 単位元からの距離（語長）
+    - adj: 行列 -> その行列から `edge_gens` で 1 ステップ到達する行列のリスト
     """
-    I = (1, 0, 0, 1)
+    I = IDENTITY
     q: deque[Mat] = deque([I])
     visited: Dict[Mat, int] = {I: 0}
     order: List[Mat] = [I]
+    index: Dict[Mat, int] = {I: 0}
+    adj: Dict[Mat, List[Mat]] = {}
+
     while q:
         g = q.popleft()
         d = visited[g]
+
+        # 探索（到達可能集合の拡張）
         for s in gens:
             ng = mat_mul(s, g, p)  # left multiplication: s * g
             if ng not in visited:
                 visited[ng] = d + 1
+                index[ng] = len(order)
                 order.append(ng)
                 q.append(ng)
                 if max_nodes is not None and len(order) >= max_nodes:
                     q.clear()
                     break
-    index = {m: i for i, m in enumerate(order)}
-    return order, index, visited
+
+        # 描画用の近傍（後段のエッジ追加で利用）
+        if edge_gens is not None:
+            neighs: List[Mat] = []
+            for s in edge_gens:
+                h = mat_mul(s, g, p)
+                neighs.append(h)
+            adj[g] = neighs
+
+    return order, index, visited, adj
 
 
 def build_cayley_graph(
@@ -138,19 +155,29 @@ def build_cayley_graph(
     - index: 行列 -> ノード番号
     - dist: 行列 -> 単位元からの距離
     """
-    gens = generators_Ak_Bk(k, p, symmetric=symmetric)
-    nodes, index, dist = bfs_component(gens, p, max_nodes=max_nodes)
+    # 生成元の準備：
+    #   ・探索用 explore_gens は無向化したい場合は逆元も含める（連結成分を漏らさない）
+    #   ・辺構築用 edge_gens は {A, B} のみ（無向グラフでは重複計算を避ける）
+    explore_gens = generators_Ak_Bk(k, p, symmetric=symmetric)
+    forward_gens = generators_Ak_Bk(k, p, symmetric=False)  # [A, B]
+
+    nodes, index, dist, adj = bfs_component(
+        explore_gens,
+        p,
+        max_nodes=max_nodes,
+        edge_gens=forward_gens,
+    )
 
     G = nx.DiGraph() if directed else nx.Graph()
-    # Add nodes with attributes
-    for m in nodes:
-        G.add_node(index[m], mat=m, label=mat_str(m), dist=dist[m])
 
-    # Add edges according to generators
+    # ノード追加（ラベル文字列は必要になったときだけ描画側で生成してコスト削減）
+    for m in nodes:
+        G.add_node(index[m], mat=m, dist=dist[m])
+
+    # エッジ追加：BFS 中に計算済みの近傍を利用し、重複乗算を避ける
     for g in nodes:
         gi = index[g]
-        for s in gens if (directed or symmetric) else gens:
-            h = mat_mul(s, g, p)
+        for h in adj.get(g, []):
             if h in index:
                 hi = index[h]
                 if directed:
@@ -158,6 +185,7 @@ def build_cayley_graph(
                 else:
                     if gi != hi:
                         G.add_edge(gi, hi)
+
     return G, nodes, index, dist
 
 
@@ -205,16 +233,13 @@ def draw_graph(
 
     # Colors by distance from identity
     # dist is keyed by matrix; we need per-node list in node index order
-    dvals = []
-    for i in range(len(nodes)):
-        m = nodes[i]
-        dvals.append(dist[m])
+    dvals = [dist[m] for m in nodes]
 
     plt.figure(figsize=figsize)
     nx.draw_networkx_nodes(G, pos, node_color=dvals, cmap=cmap, node_size=node_size)
     nx.draw_networkx_edges(G, pos, alpha=edge_alpha)
     if len(nodes) <= label_threshold:
-        labels = {i: G.nodes[i]["label"] for i in G.nodes}
+        labels = {i: mat_str(nodes[i]) for i in G.nodes}
         nx.draw_networkx_labels(G, pos, labels=labels, font_size=8)
     if title:
         plt.title(title)
